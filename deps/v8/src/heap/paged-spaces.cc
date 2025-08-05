@@ -127,7 +127,7 @@ void PagedSpaceBase::MergeCompactionSpace(CompactionSpace* other) {
     other->RemovePage(p);
     AddPage(p);
     DCHECK_IMPLIES(
-        !p->Chunk()->IsFlagSet(MemoryChunk::NEVER_ALLOCATE_ON_PAGE),
+        !p->never_allocate_on_chunk(),
         p->AvailableInFreeList() == p->AvailableInFreeListFromAllocatedBytes());
 
     // TODO(leszeks): Here we should allocation step, but:
@@ -300,7 +300,7 @@ bool PagedSpaceBase::TryExpand(LocalHeap* local_heap, AllocationOrigin origin) {
   }
   const MemoryAllocator::AllocationMode allocation_mode =
       (identity() == NEW_SPACE || identity() == OLD_SPACE)
-          ? MemoryAllocator::AllocationMode::kUsePool
+          ? MemoryAllocator::AllocationMode::kTryDelayedAndPooled
           : MemoryAllocator::AllocationMode::kRegular;
   PageMetadata* page = heap()->memory_allocator()->AllocatePage(
       allocation_mode, this, executable());
@@ -329,12 +329,11 @@ size_t PagedSpaceBase::Waste() const {
   return free_list_->wasted_bytes();
 }
 
-void PagedSpaceBase::ReleasePage(PageMetadata* page) {
-  ReleasePageImpl(page, MemoryAllocator::FreeMode::kImmediately);
+void PagedSpaceBase::RemovePageFromSpace(PageMetadata* page) {
+  RemovePageFromSpaceImpl(page);
 }
 
-void PagedSpaceBase::ReleasePageImpl(PageMetadata* page,
-                                     MemoryAllocator::FreeMode free_mode) {
+void PagedSpaceBase::RemovePageFromSpaceImpl(PageMetadata* page) {
   DCHECK(page->SweepingDone());
   DCHECK_EQ(0, page->live_bytes());
   DCHECK_EQ(page->owner(), this);
@@ -353,7 +352,6 @@ void PagedSpaceBase::ReleasePageImpl(PageMetadata* page,
   AccountUncommitted(page->size());
   DecrementCommittedPhysicalMemory(page->CommittedPhysicalMemory());
   accounting_stats_.DecreaseCapacity(page->area_size());
-  heap()->memory_allocator()->Free(free_mode, page);
 }
 
 std::unique_ptr<ObjectIterator> PagedSpaceBase::GetObjectIterator(Heap* heap) {
@@ -535,7 +533,7 @@ size_t PagedSpaceBase::RelinkFreeListCategories(PageMetadata* page) {
   });
   free_list()->increase_wasted_bytes(page->wasted_memory());
 
-  DCHECK_IMPLIES(!page->Chunk()->IsFlagSet(MemoryChunk::NEVER_ALLOCATE_ON_PAGE),
+  DCHECK_IMPLIES(!page->never_allocate_on_chunk(),
                  page->AvailableInFreeList() ==
                      page->AvailableInFreeListFromAllocatedBytes());
   return added;
@@ -552,7 +550,7 @@ void PagedSpaceBase::RefillFreeList() {
   for (PageMetadata* p : heap()->sweeper()->GetAllSweptPagesSafe(this)) {
     // We regularly sweep NEVER_ALLOCATE_ON_PAGE pages. We drop the freelist
     // entries here to make them unavailable for allocations.
-    if (p->Chunk()->IsFlagSet(MemoryChunk::NEVER_ALLOCATE_ON_PAGE)) {
+    if (p->never_allocate_on_chunk()) {
       free_list_->EvictFreeListItems(p);
     }
 
@@ -591,7 +589,7 @@ void CompactionSpace::RefillFreeList() {
          (p = sweeper->GetSweptPageSafe(this))) {
     // We regularly sweep NEVER_ALLOCATE_ON_PAGE pages. We drop the freelist
     // entries here to make them unavailable for allocations.
-    if (p->Chunk()->IsFlagSet(MemoryChunk::NEVER_ALLOCATE_ON_PAGE)) {
+    if (p->never_allocate_on_chunk()) {
       free_list()->EvictFreeListItems(p);
     }
 
@@ -646,10 +644,6 @@ void OldSpace::AddPromotedPage(PageMetadata* page, FreeMode free_mode) {
   }
 }
 
-void OldSpace::ReleasePage(PageMetadata* page) {
-  ReleasePageImpl(page, MemoryAllocator::FreeMode::kPool);
-}
-
 void OldSpace::RelinkQuarantinedPageFreeList(PageMetadata* page,
                                              size_t filler_size_on_page) {
   base::MutexGuard guard(mutex());
@@ -668,16 +662,6 @@ void OldSpace::RelinkQuarantinedPageFreeList(PageMetadata* page,
 void StickySpace::AdjustDifferenceInAllocatedBytes(size_t diff) {
   DCHECK_GE(allocated_old_size_, diff);
   allocated_old_size_ -= diff;
-}
-
-// -----------------------------------------------------------------------------
-// SharedSpace implementation
-
-void SharedSpace::ReleasePage(PageMetadata* page) {
-  // Old-to-new slots in old objects may be overwritten with references to
-  // shared objects. Postpone releasing empty pages so that updating old-to-new
-  // slots in dead old objects may access the dead shared objects.
-  ReleasePageImpl(page, MemoryAllocator::FreeMode::kPostpone);
 }
 
 }  // namespace internal
